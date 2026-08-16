@@ -64,9 +64,23 @@ part still fetches the full range in one pass, but only 2 bands (blue +
 fmask) instead of the full 6-7, which keeps its footprint far smaller than
 loading everything would. None of this changes any result - same pixels,
 same connectivity calls, same reference values - only how much is held in
-memory at once. If a very large ROI still runs out of memory, lowering
-`DEFAULT_BATCH_MONTHS` (e.g. to 6 or 3) trades some speed for a smaller
-per-batch footprint.
+memory at once. After each batch, `_release_memory()` forces a garbage
+collection pass and asks glibc to actually return freed memory to the OS -
+CPython/glibc otherwise tend to hold onto large freed blocks for reuse
+rather than releasing them, which in a long run of many batches back to
+back can make the process's OS-visible memory keep climbing even though
+nothing is really "leaking". If a very large ROI still runs out of memory,
+lowering `DEFAULT_BATCH_MONTHS` (currently 6) trades some speed for a
+smaller per-batch footprint.
+
+**This only bounds one run's own memory use, not concurrent runs.**
+Streamlit Community Cloud runs the whole app as one process shared by
+every visitor - each browser session gets isolated `st.session_state`, but
+they all draw from the same memory ceiling. If multiple people run an
+analysis at close to the same time, their peak memory needs stack on top
+of each other. There's no concurrency limiter in this build yet to queue
+overlapping runs - worth adding if this app sees real simultaneous
+traffic.
 
 **`opencv-python-headless` instead of `opencv-python`.** The vendored
 `vendor/rsderiv/sen1.py` module (a Sentinel-1 SAR speckle filter) imports

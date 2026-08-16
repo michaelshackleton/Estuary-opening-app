@@ -40,6 +40,7 @@ interface (get_polygon / get_region_extent) directly from a GeoDataFrame.
 from __future__ import annotations
 
 import copy
+import gc
 import os
 import sys
 import tempfile
@@ -85,8 +86,10 @@ SENSOR_PRODUCT = {v: k for k, v in PRODUCT_SENSOR_LABEL.items()}
 # host. 12 months is a balance between keeping peak memory bounded and not
 # firing off too many small STAC/data requests; lower it if a run still
 # runs out of memory on a very large ROI, raise it if runs feel slow on a
-# small one.
-DEFAULT_BATCH_MONTHS = 12
+# small one. Deliberately conservative (6, not 12) - Streamlit Community
+# Cloud's ~1GB container has to hold Python/Streamlit/dask/odc-stac's own
+# baseline footprint too, on top of whichever batch is being processed.
+DEFAULT_BATCH_MONTHS = 6
 
 # The clear-sky reference (connectivity.build_clear_sky_reference) only
 # needs a handful of clear observations per pixel to be reliable - that's
@@ -201,6 +204,33 @@ def _split_items_into_batches(items: list, batch_months: int) -> list[list]:
     if current:
         batches.append(current)
     return batches
+
+
+def _release_memory() -> None:
+    """Best-effort: force a full garbage-collection pass (catches any
+    reference cycles xarray/rioxarray/dask objects can leave behind, which
+    plain `del` alone doesn't clean up until the cyclic collector next
+    runs), then ask glibc to actually return freed heap memory to the OS.
+
+    CPython's own allocator, and glibc's malloc underneath it, generally
+    keep large freed blocks around for reuse rather than handing them back
+    to the OS immediately. That's harmless for a short script, but in a
+    long-running server process working through many large batches of
+    scenes back-to-back (see run_site_analysis()'s batching), the
+    process's OS-visible memory (RSS) can keep climbing well past what's
+    actually still referenced from Python's point of view - eventually
+    tripping the container's hard memory limit even though nothing is
+    "leaking" in the usual sense. Called after every batch and after the
+    reference-building pass for exactly this reason. `malloc_trim` is a
+    glibc-specific, Linux-only call (which is what Streamlit Community
+    Cloud runs on) - wrapped in a broad try/except so this is always safe
+    to call even somewhere that doesn't have it."""
+    gc.collect()
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
 
 
 def _stac_work_dir() -> str:
@@ -364,6 +394,7 @@ def run_site_analysis(
                     percentile=temporal_anomaly_percentile, min_clear_obs=temporal_anomaly_min_obs,
                 )
                 del ref_processed, ref_xr_ds, blue_stack, fmask_stack  # free before pass 2's fetching starts
+                _release_memory()
             else:
                 print(f"Warning: temporal-anomaly detection requested but 'nbart_blue' not in {product_code}'s bands - skipping for this product.")
         clear_sky_references[product_code] = clear_sky_reference
@@ -465,6 +496,7 @@ def run_site_analysis(
                     product_records[date] = (candidate_key, record)
 
             del processed, xr_ds  # free this batch's rasters before fetching the next one
+            _release_memory()
 
         records.extend(record for _, record in product_records.values())
 
