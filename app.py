@@ -44,7 +44,6 @@ if BASE_DIR not in sys.path:
 from modules import aggregate, connectivity, fetch  # noqa: E402
 from modules.region import SiteLayers, geojson_features_to_gdf  # noqa: E402
 
-CACHE_DIR = os.path.join(BASE_DIR, "data_cache")
 PRODUCTS_JSON = os.path.join(BASE_DIR, "config", "products.json")
 
 AUSTRALIA_CENTER = (-25.27, 133.775)
@@ -108,6 +107,18 @@ def init_state():
         temporal_anomaly_threshold=connectivity.DEFAULT_TEMPORAL_ANOMALY_THRESHOLD_DN,
         temporal_anomaly_percentile=10.0,
         temporal_anomaly_min_obs=3,
+        # Per-product clear-sky brightness reference built by the most
+        # recent "Run analysis" (see fetch.run_site_analysis) - kept only
+        # in this session's memory, never written to the server's disk,
+        # since it's specific to this user's own ROI/run. {} until a run
+        # with temporal-anomaly detection enabled has completed.
+        clear_sky_references={},
+        # The single scene currently shown in "Scene preview" below, kept
+        # only in this session's memory (see modules/fetch.py's docstring
+        # for why nothing is cached to the server's disk). Overwritten -
+        # and the old scene's arrays dropped - as soon as a different
+        # point is selected; never persists past this browser session.
+        preview_scene=None,
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -210,6 +221,8 @@ if uploaded_site is not None and st.sidebar.button("Load uploaded site layers"):
         st.session_state.structures_decided = True  # loading implies the decision was already made
         st.session_state.site_name = loaded.name
         st.session_state.results_df = None
+        st.session_state.clear_sky_references = {}
+        st.session_state.preview_scene = None
         st.session_state.roi_map_v += 1
         st.session_state.lines_map_v += 1
         st.session_state.struct_map_v += 1
@@ -224,31 +237,11 @@ if st.sidebar.button("Start a new (blank) site"):
     st.session_state.structures_gdf = None
     st.session_state.structures_decided = False
     st.session_state.results_df = None
+    st.session_state.clear_sky_references = {}
+    st.session_state.preview_scene = None
     st.session_state.roi_map_v += 1
     st.session_state.lines_map_v += 1
     st.session_state.struct_map_v += 1
-    st.rerun()
-
-def format_bytes(n: int) -> str:
-    for unit in ["B", "KB", "MB", "GB"]:
-        if n < 1024:
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
-
-
-st.sidebar.markdown("**Raster cache**")
-st.sidebar.caption(
-    f"{format_bytes(fetch.cache_size_bytes(CACHE_DIR))} on disk under `data_cache/`. "
-    "Only scenes you've actually opened in the scene preview get downloaded and kept "
-    "here - running an analysis does not cache rasters by default. On this hosted "
-    "version, this cache lives on the server's own temporary storage and is cleared "
-    "whenever the app restarts or redeploys - it's just a same-session speed-up, not "
-    "somewhere to keep anything long-term."
-)
-if st.sidebar.button("Clear raster cache"):
-    fetch.clear_cache(CACHE_DIR)
-    st.sidebar.success("Cache cleared. Scene previews will re-download as needed.")
     st.rerun()
 
 with st.sidebar.expander("About the classification", expanded=False):
@@ -498,21 +491,6 @@ with tab_run:
             ),
         )
 
-        cache_during_run = st.checkbox(
-            "Cache every scene's raster during this run",
-            value=False,
-            help=(
-                "Off by default - the analysis itself never needs rasters saved to disk, it only "
-                "needs each scene in memory momentarily. Leaving this off means the scene preview "
-                "downloads a raster on demand only when you click a point on the results plot "
-                "(and keeps it cached for a fast re-click), rather than every scene in the whole "
-                "date range piling up in data_cache/ regardless of whether you ever look at it. "
-                "Turn this on only if you plan to click through most of the points afterwards and "
-                "don't mind the extra disk use - remember this cache is on the server's own "
-                "temporary storage on this hosted version, not your computer."
-            ),
-        )
-
         run_clicked = st.button("Run analysis", type="primary")
 
         if run_clicked:
@@ -536,14 +514,12 @@ with tab_run:
 
                 with st.spinner("Fetching and analysing scenes..."):
                     try:
-                        records = fetch.run_site_analysis(
+                        records, clear_sky_references = fetch.run_site_analysis(
                             site=site,
                             start_date=start.isoformat(),
                             end_date=end.isoformat(),
                             max_cloud=max_cloud,
                             products_json_path=PRODUCTS_JSON,
-                            cache_dir=CACHE_DIR,
-                            cache_rasters=cache_during_run,
                             min_roi_coverage=fetch.FULL_COVERAGE_THRESHOLD if require_full_coverage else 0,
                             progress_cb=progress_cb,
                             cloud_buffer_px=cloud_buffer_px,
@@ -554,6 +530,8 @@ with tab_run:
                         )
                         st.session_state.raw_records = records
                         st.session_state.results_df = aggregate.build_results_df(records)
+                        st.session_state.clear_sky_references = clear_sky_references
+                        st.session_state.preview_scene = None  # a fresh run invalidates any stale preview
                         status_text.write(f"Done - {len(records)} scenes processed.")
                     except Exception as e:
                         st.exception(e)
@@ -623,7 +601,7 @@ with tab_run:
             with dl_col:
                 st.download_button(
                     "Download results as CSV",
-                    data=combined.drop(columns=["cache_path"], errors="ignore").to_csv(index=False).encode("utf-8"),
+                    data=combined.to_csv(index=False).encode("utf-8"),
                     file_name=f"{st.session_state.site_name}_results.csv",
                     mime="text/csv",
                 )
@@ -658,29 +636,37 @@ with tab_run:
                     structures=st.session_state.structures_gdf,
                 )
 
-                scene_data = None
+                # Only the single most-recently-viewed scene is ever kept in
+                # memory (st.session_state.preview_scene), never written to
+                # disk - see modules/fetch.py's docstring for why (a
+                # server-side cache shared across every visitor risks one
+                # user seeing another user's scene). Selecting a different
+                # point drops the old scene's arrays entirely (they're just
+                # overwritten here, so Python garbage-collects them) and
+                # re-fetches from DEA; re-clicking the same point reuses
+                # what's already in memory for this session.
+                preview_key = (site_for_preview.name, selected["sensor"], selected["date"].strftime("%Y-%m-%d"))
+                cached_preview = st.session_state.preview_scene
                 fetch_diagnostics = None
-                clear_sky_reference = None
-                cache_path = selected.get("cache_path")
-                if cache_path and os.path.exists(cache_path):
-                    scene_data = fetch.read_scene_geotiff(cache_path)
-                    bands_for_ref = scene_data[0]
-                    clear_sky_reference = fetch.load_cached_temporal_reference(
-                        CACHE_DIR, site_for_preview.name, fetch.SENSOR_PRODUCT.get(selected["sensor"]),
-                        expected_shape=bands_for_ref["nbart_blue"].shape if "nbart_blue" in bands_for_ref else None,
-                    )
+                if cached_preview is not None and cached_preview["key"] == preview_key:
+                    scene_data = (cached_preview["bands"], cached_preview["transform"], cached_preview["crs"])
                 else:
-                    # Not cached (bulk caching is off by default) - fetch just this one
-                    # scene on demand instead of requiring a full cached run.
+                    scene_data = None
                     with st.spinner(f"Downloading the {selected['sensor']} scene for {selected['date'].date()} from DEA..."):
                         try:
-                            bands, transform, crs, _, fetch_diagnostics, clear_sky_reference = fetch.fetch_single_scene(
-                                site_for_preview, selected["date"], selected["sensor"],
-                                PRODUCTS_JSON, cache_dir=CACHE_DIR,
+                            bands, transform, crs, fetch_diagnostics = fetch.fetch_single_scene(
+                                site_for_preview, selected["date"], selected["sensor"], PRODUCTS_JSON,
                             )
                             scene_data = (bands, transform, crs)
+                            st.session_state.preview_scene = {
+                                "key": preview_key, "bands": bands, "transform": transform, "crs": crs,
+                            }
                         except Exception as e:
                             st.error(f"Could not fetch this scene from DEA: {e}")
+
+                clear_sky_reference = st.session_state.clear_sky_references.get(
+                    fetch.SENSOR_PRODUCT.get(selected["sensor"])
+                )
 
                 # Surface what was actually fetched - a near-blank preview is much
                 # easier to diagnose with this in front of you than by guessing.
@@ -728,6 +714,13 @@ with tab_run:
                         ),
                     )
                 bands, transform, crs = scene_data
+                st.download_button(
+                    "Download this scene as GeoTIFF",
+                    data=fetch.write_scene_geotiff_bytes(bands, transform, crs),
+                    file_name=f"{site_for_preview.name}_{selected['sensor']}_{selected['date'].date()}.tif",
+                    mime="image/tiff",
+                    help="Saves this scene straight to your own computer - the server never keeps a copy.",
+                )
                 sensor, nir_band = connectivity.detect_sensor_and_nir_band(bands.keys())
                 ndwi = connectivity.calc_ndwi(bands["nbart_green"], bands[nir_band])
                 fmask = bands["oa_fmask"]
@@ -882,9 +875,10 @@ with tab_run:
                     )
                     if clear_sky_reference is None:
                         st.caption(
-                            "No cached clear-sky reference found for this site/sensor yet, so the orange "
-                            "temporal-anomaly class can't be shown here - run an analysis with 'Enable "
-                            "temporal anomaly detection' checked first, which builds and caches one."
+                            "No clear-sky reference built for this site/sensor this session yet, so the "
+                            "orange temporal-anomaly class can't be shown here - run an analysis with "
+                            "'Enable temporal anomaly detection' checked first, which builds one from that "
+                            "run's own scenes (kept in memory for this session only, never saved to disk)."
                         )
                 elif bg_choice != "NDWI (continuous)":
                     st.caption(

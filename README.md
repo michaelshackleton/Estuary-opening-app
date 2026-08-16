@@ -23,12 +23,29 @@ filesystem and no display to pop a dialog on, so this version instead:
 Keep that JSON file somewhere sensible (a folder per site works well) and
 you can restore a site instantly without redrawing.
 
-**The raster cache is ephemeral.** `data_cache/` still speeds up re-clicking
-the same scene in the preview during a session, but it lives on the hosted
-container's own temporary disk - it's wiped whenever the app restarts or
-you push a new deploy. This was already true of the desktop app's cache in
-spirit (it's just a convenience, never required for the analysis itself),
-but on the desktop it happened to persist between sessions; here it won't.
+**No raster ever touches the server's disk.** The desktop app caches
+fetched scenes to a `data_cache/` folder on your own machine, which is
+fine there - it's your machine. On a shared host like Streamlit Community
+Cloud, every visitor's browser talks to the *same* running server process.
+`st.session_state` is isolated per browser session, but a file written to
+the server's actual filesystem is not - a disk cache keyed only by site
+name + sensor + date (as the desktop app's is) means two different people
+who happen to type the same site name (e.g. both leave it at the default
+"new_site") and preview an overlapping date would silently load *each
+other's* cached raster, clipped to a *different* ROI. That's a real
+cross-user data leak on a multi-tenant host, not a hypothetical.
+
+So this build never writes a scene to disk at all. The scene preview keeps
+only the single most-recently-viewed scene in memory
+(`st.session_state.preview_scene`), automatically replaced (and the old
+one dropped) the moment you click a different point on the results plot,
+and automatically gone the moment your browser session ends - nothing to
+clear, nothing shared between users. If you want a local copy of a scene,
+use the "Download this scene as GeoTIFF" button under the preview - it
+streams straight to your own computer, never the server. There's no
+"cache every scene during this run" option either, for the same reason -
+the full-run analysis already only ever holds one scene in memory at a
+time to compute its connectivity result, then discards it.
 
 **`opencv-python-headless` instead of `opencv-python`.** The vendored
 `vendor/rsderiv/sen1.py` module (a Sentinel-1 SAR speckle filter) imports
@@ -91,7 +108,9 @@ streamlit run app.py
   depends on, so it doesn't need the rest of `rs-utils-main` alongside it.
 - `config/products.json` - the two DEA product definitions used
   (`landsat_full`, `sentinel_full`).
-- `data_cache/` - ephemeral per-session scene cache (see above).
+
+There is no `data_cache/` folder in this build - see "No raster ever
+touches the server's disk" above.
 
 See `Claude_script/README.md` (the original desktop app) for the full
 design-decisions writeup - open/closed combination rule, cloud-edge buffer,
