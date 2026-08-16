@@ -47,6 +47,27 @@ streams straight to your own computer, never the server. There's no
 the full-run analysis already only ever holds one scene in memory at a
 time to compute its connectivity result, then discards it.
 
+**Long analysis runs are processed in yearly batches, not all at once.**
+The desktop app's `run_site_analysis()` loads every matched scene's full
+band set for the whole requested date range into memory in one shot before
+processing anything. On a desktop with plenty of RAM that's rarely an
+issue; on Streamlit Community Cloud's ~1GB container it isn't hypothetical
+- a 6-year, two-sensor run with temporal anomaly detection enabled reliably
+crashed the whole app (confirmed in testing). This build fetches and
+processes each product's scenes in batches of about a year at a time
+(`modules/fetch.py`'s `DEFAULT_BATCH_MONTHS`), discarding each batch before
+fetching the next, so peak memory stays roughly flat regardless of how long
+a date range you ask for. The one exception is the temporal-anomaly
+clear-sky reference, which genuinely needs to see every scene across the
+whole range at once to mean what it's supposed to as a percentile - that
+part still fetches the full range in one pass, but only 2 bands (blue +
+fmask) instead of the full 6-7, which keeps its footprint far smaller than
+loading everything would. None of this changes any result - same pixels,
+same connectivity calls, same reference values - only how much is held in
+memory at once. If a very large ROI still runs out of memory, lowering
+`DEFAULT_BATCH_MONTHS` (e.g. to 6 or 3) trades some speed for a smaller
+per-batch footprint.
+
 **`opencv-python-headless` instead of `opencv-python`.** The vendored
 `vendor/rsderiv/sen1.py` module (a Sentinel-1 SAR speckle filter) imports
 `cv2` at module load time, even though this app never processes SAR data
