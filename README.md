@@ -1,17 +1,18 @@
 # Estuary Mouth Monitor (cloud-hosted build)
 
-This is a fork of `Claude_script/` (the original desktop Estuary Mouth
-Monitor app), adapted to run on **Streamlit Community Cloud**
-(share.streamlit.io) instead of on your own machine. Same map, same
-open/closed/indeterminate classification, same DEA data source - the only
-things that changed are the bits that only make sense on a desktop with its
-own display and filesystem.
+This is the cloud-hosted, run-in-the-browser build of the Estuary Mouth
+Monitor app, deployed on **Streamlit Community Cloud**
+(share.streamlit.io). It's the counterpart to the local desktop version at
+[Estuary-opening-local-app](https://github.com/michaelshackleton/Estuary-opening-local-app) -
+same map, same open/closed/indeterminate classification, same DEA data
+source. The differences below are only the bits that don't make sense on a
+shared server with no display or persistent filesystem of its own.
 
 ## What's different from the desktop version
 
-**Site-layer save/load is now a file download/upload, not a folder
-picker.** The desktop app opens a native Windows "browse for folder" dialog
-and writes Esri Shapefiles to it. A server has no access to your computer's
+**Site-layer save/load is a file download/upload, not a folder picker.**
+The desktop version opens a native Windows "browse for folder" dialog and
+writes Esri Shapefiles to it. A server has no access to your computer's
 filesystem and no display to pop a dialog on, so this version instead:
 
 - **Save**: click "Download site layers (.json)" in the sidebar - your
@@ -23,19 +24,17 @@ filesystem and no display to pop a dialog on, so this version instead:
 Keep that JSON file somewhere sensible (a folder per site works well) and
 you can restore a site instantly without redrawing.
 
-**No raster ever touches the server's disk.** The desktop app caches
+**No raster ever touches the server's disk.** The desktop version caches
 fetched scenes to a `data_cache/` folder on your own machine, which is
 fine there - it's your machine. On a shared host like Streamlit Community
 Cloud, every visitor's browser talks to the *same* running server process.
 `st.session_state` is isolated per browser session, but a file written to
 the server's actual filesystem is not - a disk cache keyed only by site
-name + sensor + date (as the desktop app's is) means two different people
-who happen to type the same site name (e.g. both leave it at the default
-"new_site") and preview an overlapping date would silently load *each
-other's* cached raster, clipped to a *different* ROI. That's a real
-cross-user data leak on a multi-tenant host, not a hypothetical.
-
-So this build never writes a scene to disk at all. The scene preview keeps
+name + sensor + date would let two different people who happen to type the
+same site name (e.g. both leave it at the default "new_site") and preview
+an overlapping date silently load *each other's* cached raster, clipped to
+a *different* ROI. To avoid that cross-user risk on a multi-tenant host,
+this build never writes a scene to disk at all. The scene preview keeps
 only the single most-recently-viewed scene in memory
 (`st.session_state.preview_scene`), automatically replaced (and the old
 one dropped) the moment you click a different point on the results plot,
@@ -47,14 +46,14 @@ streams straight to your own computer, never the server. There's no
 the full-run analysis already only ever holds one scene in memory at a
 time to compute its connectivity result, then discards it.
 
-**Long analysis runs are processed in yearly batches, not all at once.**
-The desktop app's `run_site_analysis()` loads every matched scene's full
-band set for the whole requested date range into memory in one shot before
-processing anything. On a desktop with plenty of RAM that's rarely an
-issue; on Streamlit Community Cloud's ~1GB container it isn't hypothetical
-- a 6-year, two-sensor run with temporal anomaly detection enabled reliably
-crashed the whole app (confirmed in testing). This build fetches and
-processes each product's scenes in batches of about a year at a time
+**Long analysis runs are processed in batches, not all at once.**
+The desktop version's `run_site_analysis()` loads every matched scene's
+full band set for the whole requested date range into memory in one shot
+before processing anything. On a desktop with plenty of RAM that's rarely
+an issue; on Streamlit Community Cloud's ~1GB container it can run out of
+memory on longer, multi-sensor runs with temporal anomaly detection
+enabled. This build fetches and processes each product's scenes in batches
+of about six months at a time
 (`modules/fetch.py`'s `DEFAULT_BATCH_MONTHS`), discarding each batch before
 fetching the next, so peak memory stays roughly flat regardless of how long
 a date range you ask for. The one exception is the temporal-anomaly
@@ -78,9 +77,8 @@ Streamlit Community Cloud runs the whole app as one process shared by
 every visitor - each browser session gets isolated `st.session_state`, but
 they all draw from the same memory ceiling. If multiple people run an
 analysis at close to the same time, their peak memory needs stack on top
-of each other. There's no concurrency limiter in this build yet to queue
-overlapping runs - worth adding if this app sees real simultaneous
-traffic.
+of each other. There is currently no mechanism to queue or limit
+overlapping analysis runs.
 
 **`opencv-python-headless` instead of `opencv-python`.** The vendored
 `vendor/rsderiv/sen1.py` module (a Sentinel-1 SAR speckle filter) imports
@@ -140,14 +138,14 @@ streamlit run app.py
 - `modules/aggregate.py` - builds the results table and the mean-monthly
   proportion-closed statistic.
 - `vendor/` - self-contained copies of the DEA-fetch helpers this app
-  depends on, so it doesn't need the rest of `rs-utils-main` alongside it.
+  depends on, so it doesn't need anything else alongside it to run.
 - `config/products.json` - the two DEA product definitions used
   (`landsat_full`, `sentinel_full`).
 
 There is no `data_cache/` folder in this build - see "No raster ever
 touches the server's disk" above.
 
-See `Claude_script/README.md` (the original desktop app) for the full
-design-decisions writeup - open/closed combination rule, cloud-edge buffer,
-temporal anomaly detection, connectivity diagnostic, etc. - all of that
-still applies unchanged here.
+See the [local desktop app's README](https://github.com/michaelshackleton/Estuary-opening-local-app)
+for the full design-decisions writeup - open/closed combination rule,
+cloud-edge buffer, temporal anomaly detection, connectivity diagnostic,
+etc. - all of that applies unchanged here.
