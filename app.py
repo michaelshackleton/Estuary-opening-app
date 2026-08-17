@@ -45,6 +45,7 @@ from modules import aggregate, connectivity, fetch  # noqa: E402
 from modules.region import SiteLayers, geojson_features_to_gdf  # noqa: E402
 
 PRODUCTS_JSON = os.path.join(BASE_DIR, "config", "products.json")
+MURRAY_MOUTH_IMAGE = os.path.join(BASE_DIR, "Murray_mouth.jpg")
 
 AUSTRALIA_CENTER = (-25.27, 133.775)
 LANDSAT5_START = date(1985, 3, 1)
@@ -263,9 +264,76 @@ with st.sidebar.expander("About the classification", expanded=False):
 # Main layout: drawing workflow tabs + run/results tab
 # --------------------------------------------------------------------------
 
-tab_roi, tab_lines, tab_struct, tab_run = st.tabs(
-    ["1. Region of interest", "2. Inside / outside lines", "3. Structures (optional)", "4. Run & results"]
+tab_home, tab_roi, tab_lines, tab_struct, tab_run = st.tabs(
+    ["Home", "1. Region of interest", "2. Inside / outside lines", "3. Structures (optional)", "4. Run & results"]
 )
+
+with tab_home:
+    st.title("Estuary Mouth Monitor")
+    st.markdown(
+        """
+        This app detects whether an estuary mouth is **open or closed** using
+        satellite imagery, and lets you view and analyse how often it closes
+        over time.
+
+        It works by fetching every available Landsat and Sentinel-2 scene
+        over a chosen estuary from [Digital Earth Australia](https://www.dea.ga.gov.au/)
+        and testing, on each one, whether there's a connected path of water
+        between a point just inside the mouth and a point just outside it.
+        Run it over a period of months or years and you get a time series of
+        open/closed/indeterminate calls - and from that, statistics like the
+        proportion of time the mouth has been closed.
+        """
+    )
+
+    if os.path.exists(MURRAY_MOUTH_IMAGE):
+        st.image(
+            MURRAY_MOUTH_IMAGE,
+            caption=(
+                "The Murray River mouth, South Australia - a Landsat/Sentinel-2 scene over the "
+                "Coorong. The blue box is an example region of interest drawn around the mouth, "
+                "the same first step you'll do for your own site in tab 1 below."
+            ),
+        )
+
+    st.subheader("How to use it")
+    st.markdown(
+        """
+        Work through the numbered tabs above in order, left to right:
+
+        1. **Region of interest** - draw a box or polygon around the estuary
+           mouth on the satellite map. This defines the area imagery is
+           fetched and clipped to, so keep it reasonably tight around the
+           mouth rather than the whole estuary.
+        2. **Inside / outside lines** - draw exactly two lines: one crossing
+           the water on the river ("inside") side of the mouth, one crossing
+           it on the ocean ("outside") side. On each satellite scene, the app
+           checks whether water connects these two lines - if it does, the
+           mouth is open on that date.
+        3. **Structures (optional)** - if a bridge or causeway crosses the
+           estuary near your lines, draw a polygon over it so it's always
+           treated as passable water, rather than wrongly breaking the
+           connection.
+        4. **Run & results** - pick a date range and maximum cloud cover,
+           then run the analysis. You'll get a time series plot of
+           open/closed/indeterminate status, summary statistics (including
+           the mean monthly proportion of time closed), and a scene preview
+           where you can click any point on the plot to see exactly what the
+           satellite image and classification looked like on that date.
+
+        A few other things worth knowing about, in the sidebar:
+
+        - **Save / load site layers** lets you download your drawn ROI,
+          lines and structures as a single file, and re-upload it later to
+          pick up an existing site without redrawing.
+        - **About the classification** (further down the sidebar) explains
+          the open/closed/indeterminate logic in more detail.
+        - The "Advanced" sections in tab 4 (cloud-edge buffer, temporal
+          anomaly detection) are optional tuning for tricky sites where
+          cloud or haze is causing false results - the defaults work well
+          for most estuaries, so it's fine to leave them alone starting out.
+        """
+    )
 
 with tab_roi:
     if st.session_state.roi_gdf is not None:
