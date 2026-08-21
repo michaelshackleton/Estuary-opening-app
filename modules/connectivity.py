@@ -558,6 +558,7 @@ def process_scene(
     inside_gdf,
     outside_gdf,
     structures_gdf=None,
+    sandbars_gdf=None,
     is_water: IsWaterFn = default_is_water,
     connectivity: int = 8,
     cloud_buffer_px: Optional[int | dict] = None,
@@ -587,7 +588,20 @@ def process_scene(
     run. Requires 'nbart_blue' in `bands` to have any effect.
     `temporal_anomaly_threshold` is the blue-band DN excess above the
     reference that counts as anomalous - see
-    DEFAULT_TEMPORAL_ANOMALY_THRESHOLD_DN's docstring for caveats."""
+    DEFAULT_TEMPORAL_ANOMALY_THRESHOLD_DN's docstring for caveats.
+
+    `sandbars_gdf` marks areas that can legitimately alternate between
+    exposed sand and open water as a bar builds or erodes - exactly the
+    kind of change the temporal-anomaly check would otherwise misread as
+    cloud/haze contamination (a sandbar popping up reads as an anomalously
+    dark/bright shift relative to its own history, same signature as
+    haze). Pixels under a sandbar are exempted from the temporal-anomaly
+    flag entirely - unlike `structures_gdf`, they are NOT forced to water;
+    they simply keep whatever the ordinary NDWI/fmask classification found
+    for that scene. This matters because sandbars sit right where the
+    mouth is most likely to open or close, so wrongly excluding them as
+    'anomalous no-data' would blind the analysis exactly where it matters
+    most."""
     sensor, nir_band = detect_sensor_and_nir_band(bands.keys())
     green = bands["nbart_green"]
     nir = bands[nir_band]
@@ -598,6 +612,13 @@ def process_scene(
 
     shape = fmask_original.shape
     structure_mask = build_structure_mask(shape, transform, structures_gdf)
+    # Sandbar polygons rasterise the same way a structure does (just a
+    # boolean "is this pixel inside the drawn polygon" mask) - reusing
+    # build_structure_mask here doesn't force sandbar pixels to water the
+    # way it does when called for structures_gdf above; that forcing only
+    # happens later, via apply_structure_mask(structure_mask), which
+    # sandbar_mask is deliberately never passed into.
+    sandbar_mask = build_structure_mask(shape, transform, sandbars_gdf)
 
     if cloud_buffer_px is None:
         buffer_px = DEFAULT_CLOUD_BUFFER_PX.get(sensor, 0)
@@ -612,6 +633,13 @@ def process_scene(
         temporal_anomaly_mask = build_temporal_anomaly_mask(
             bands["nbart_blue"], clear_sky_reference, temporal_anomaly_threshold
         )
+        if sandbar_mask is not None:
+            # Exempt sandbar pixels from the anomaly flag entirely, before
+            # it's used anywhere below (apply_temporal_anomaly, and the
+            # indeterminate-reason labelling in
+            # check_connectivity_indeterminate) - see this function's
+            # docstring on sandbars_gdf for why.
+            temporal_anomaly_mask = temporal_anomaly_mask & ~sandbar_mask
 
     ndwi_water_strict, ndwi_unknown = apply_structure_mask(
         *apply_temporal_anomaly(

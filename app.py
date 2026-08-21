@@ -42,7 +42,9 @@ if BASE_DIR not in sys.path:
     sys.path.insert(0, BASE_DIR)
 
 from modules import aggregate, connectivity, fetch  # noqa: E402
-from modules.region import SiteLayers, geojson_features_to_gdf  # noqa: E402
+from modules.region import SiteLayers, geojson_features_to_gdf, name_from_centroid  # noqa: E402
+import io
+import zipfile
 
 PRODUCTS_JSON = os.path.join(BASE_DIR, "config", "products.json")
 MURRAY_MOUTH_IMAGE = os.path.join(BASE_DIR, "Murray_mouth.jpg")
@@ -56,6 +58,7 @@ PASTEL = dict(
     inside="#6FA8DC",        # pastel blue
     outside="#F4A6B7",       # pastel rose (paired with inside for contrast)
     structures="#FFCC99",    # pastel peach
+    sandbars="#E0C68C",      # pastel sandy tan - distinct from structures' peach
     landsat="#A9CCE3",       # pastel blue
     sentinel="#F4A6B7",      # pastel rose
     nodata="#D6D6D6",        # light grey
@@ -95,19 +98,25 @@ def init_state():
         roi_gdf=None,
         lines_gdf=None,
         structures_gdf=None,
+        sandbars_gdf=None,
         site_name="new_site",
         results_df=None,
         raw_records=None,
         run_message="",
         selected_point=None,
-        roi_map_v=0,
-        lines_map_v=0,
-        struct_map_v=0,
+        draw_map_v=0,
+        # Where the draw tab's map stays centred once the in-progress site's
+        # own roi_gdf is cleared (e.g. right after queueing) - see
+        # update_last_site_center().
+        last_site_center=None,
         structures_decided=False,
+        sandbars_decided=False,
         enable_temporal_anomaly=False,
         temporal_anomaly_threshold=connectivity.DEFAULT_TEMPORAL_ANOMALY_THRESHOLD_DN,
         temporal_anomaly_percentile=10.0,
         temporal_anomaly_min_obs=3,
+        cloud_buffer_s2=connectivity.DEFAULT_CLOUD_BUFFER_PX["sentinel2"],
+        cloud_buffer_ls=connectivity.DEFAULT_CLOUD_BUFFER_PX["landsat"],
         # Per-product clear-sky brightness reference built by the most
         # recent "Run analysis" (see fetch.run_site_analysis) - kept only
         # in this session's memory, never written to the server's disk,
@@ -120,6 +129,18 @@ def init_state():
         # and the old scene's arrays dropped - as soon as a different
         # point is selected; never persists past this browser session.
         preview_scene=None,
+        # Sites queued up for a batch run - a list of SiteLayers objects,
+        # built up in-memory this session (see "Add this site to the batch
+        # queue" in the sidebar) or bulk-uploaded from several site JSON
+        # files at once. Never written to the server's disk - just like
+        # everything else here, it's gone when the browser session ends,
+        # so download the combined/per-site CSVs (see tab_batch) if you
+        # want to keep the results.
+        site_queue=[],
+        batch_combined_df=None,
+        batch_per_site_dfs=None,
+        batch_per_site_errors=None,
+        uploaded_results_df=None,
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -148,22 +169,35 @@ def satellite_map(center=AUSTRALIA_CENTER, zoom=5):
     return m
 
 
-def add_context_layers(m, roi=None, lines=None, structures=None):
+def add_context_layers(m, roi=None, lines=None, structures=None, sandbars=None, alpha=1.0):
     """Adds already-confirmed layers to a map as static (non-editable)
     context so the user can see what they've already drawn while drawing
-    the next layer."""
+    the next layer. `alpha` scales both fill and stroke opacity - used to
+    render previously-queued sites faded (0.3) alongside whichever site is
+    currently being drawn (1.0, the default), so earlier sites stay visible
+    as spatial context on the shared map without being mistaken for the
+    active drawing."""
     if roi is not None and len(roi) > 0:
         folium.GeoJson(
-            roi, name="ROI", style_function=lambda f: {"color": PASTEL["roi"], "weight": 3, "fillOpacity": 0.08}
+            roi, name="ROI",
+            style_function=lambda f: {"color": PASTEL["roi"], "weight": 3, "opacity": alpha, "fillOpacity": 0.08 * alpha},
         ).add_to(m)
     if lines is not None and len(lines) > 0:
         for _, row in lines.iterrows():
             color = PASTEL["inside"] if row.get("position") == "inside" else PASTEL["outside"]
-            folium.GeoJson(row.geometry.__geo_interface__, style_function=lambda f, c=color: {"color": c, "weight": 5}).add_to(m)
+            folium.GeoJson(
+                row.geometry.__geo_interface__,
+                style_function=lambda f, c=color: {"color": c, "weight": 5, "opacity": alpha},
+            ).add_to(m)
     if structures is not None and len(structures) > 0:
         folium.GeoJson(
             structures, name="Structures",
-            style_function=lambda f: {"color": PASTEL["structures"], "weight": 2, "fillOpacity": 0.35},
+            style_function=lambda f: {"color": PASTEL["structures"], "weight": 2, "opacity": alpha, "fillOpacity": 0.35 * alpha},
+        ).add_to(m)
+    if sandbars is not None and len(sandbars) > 0:
+        folium.GeoJson(
+            sandbars, name="Sandbars",
+            style_function=lambda f: {"color": PASTEL["sandbars"], "weight": 2, "opacity": alpha, "fillOpacity": 0.35 * alpha, "dashArray": "4"},
         ).add_to(m)
     return m
 
@@ -173,6 +207,262 @@ def map_center_from_roi():
         c = st.session_state.roi_gdf.geometry.iloc[0].centroid
         return (c.y, c.x)
     return AUSTRALIA_CENTER
+
+
+def update_last_site_center(roi_gdf):
+    """Remembers where the map should stay centred once the in-progress
+    site's own ROI is cleared (e.g. right after queueing) - without this,
+    the draw tab's map would snap back out to the whole-of-Australia view
+    every time 'Add to batch queue' resets the current site, instead of
+    staying put on the estuary just drawn."""
+    if roi_gdf is not None and len(roi_gdf) > 0:
+        c = roi_gdf.geometry.iloc[0].centroid
+        st.session_state.last_site_center = (c.y, c.x)
+
+
+# --------------------------------------------------------------------------
+# Draw-tab step state machine - derived entirely from what's already been
+# confirmed (rather than a separately-tracked "current step" variable), so
+# redrawing an earlier layer (e.g. clicking a confirmed ROI button to redraw
+# it) automatically rewinds to the right step with no extra bookkeeping.
+# --------------------------------------------------------------------------
+
+DRAW_STEPS = ["roi", "inside", "outside", "structures", "sandbars"]
+DRAW_STEP_LABELS = {
+    "roi": "Region of interest",
+    "inside": "Inside line",
+    "outside": "Outside line",
+    "structures": "Structures",
+    "sandbars": "Sandbars",
+}
+
+
+def has_inside_line() -> bool:
+    lg = st.session_state.lines_gdf
+    return lg is not None and len(lg) > 0 and (lg["position"] == "inside").any()
+
+
+def has_outside_line() -> bool:
+    lg = st.session_state.lines_gdf
+    return lg is not None and len(lg) > 0 and (lg["position"] == "outside").any()
+
+
+def draw_step_confirmed() -> dict:
+    return {
+        "roi": st.session_state.roi_gdf is not None,
+        "inside": has_inside_line(),
+        "outside": has_outside_line(),
+        "structures": st.session_state.structures_decided,
+        "sandbars": st.session_state.sandbars_decided,
+    }
+
+
+def current_draw_step() -> str:
+    """The first not-yet-confirmed step, in order - or 'ready' once all
+    five are done and the site can be queued for batch."""
+    confirmed = draw_step_confirmed()
+    for s in DRAW_STEPS:
+        if not confirmed[s]:
+            return s
+    return "ready"
+
+
+def confirm_draw_step(step_name: str, candidates: list[dict]):
+    """Commits whatever's been drawn for `step_name` into session state and
+    advances the wizard. `candidates` is the list of GeoJSON features (from
+    the map's all_drawings) matching this step's expected geometry type.
+    Structures/sandbars can be confirmed with an empty `candidates` list
+    (meaning "none at this site") - ROI/lines cannot, since they're
+    mandatory for the analysis to run at all."""
+    if step_name == "roi":
+        if not candidates:
+            st.warning("Draw a polygon (or rectangle) around the estuary mouth first.")
+            return
+        gdf = geojson_features_to_gdf([candidates[-1]])
+        st.session_state.roi_gdf = gdf
+        # Auto-name the site from this ROI's centroid, so sites don't need a
+        # manually-typed unique name - especially useful once you're drawing
+        # several sites in one session for a batch run.
+        st.session_state.site_name = name_from_centroid(gdf)
+        update_last_site_center(gdf)
+    elif step_name in ("inside", "outside"):
+        if not candidates:
+            st.warning(f"Draw the {step_name} line first.")
+            return
+        new_row = geojson_features_to_gdf([candidates[-1]])
+        new_row["position"] = step_name
+        other_pos = "outside" if step_name == "inside" else "inside"
+        existing = st.session_state.lines_gdf
+        other_part = existing[existing["position"] == other_pos] if existing is not None and len(existing) > 0 else None
+        parts = [p for p in (new_row, other_part) if p is not None and len(p) > 0]
+        st.session_state.lines_gdf = pd.concat(parts, ignore_index=True)
+    elif step_name == "structures":
+        st.session_state.structures_gdf = geojson_features_to_gdf(candidates) if candidates else None
+        st.session_state.structures_decided = True
+    elif step_name == "sandbars":
+        st.session_state.sandbars_gdf = geojson_features_to_gdf(candidates) if candidates else None
+        st.session_state.sandbars_decided = True
+    st.session_state.draw_map_v += 1
+    st.rerun()
+
+
+def redraw_draw_step(step_name: str):
+    """Reopens an already-confirmed step for editing - only touches that
+    step's own layer, leaving other confirmed steps alone (e.g. redrawing
+    the ROI doesn't clear already-confirmed lines/structures/sandbars)."""
+    if step_name == "roi":
+        st.session_state.roi_gdf = None
+    elif step_name in ("inside", "outside"):
+        existing = st.session_state.lines_gdf
+        if existing is not None and len(existing) > 0:
+            remaining = existing[existing["position"] != step_name]
+            st.session_state.lines_gdf = remaining if len(remaining) > 0 else None
+    elif step_name == "structures":
+        st.session_state.structures_gdf = None
+        st.session_state.structures_decided = False
+    elif step_name == "sandbars":
+        st.session_state.sandbars_gdf = None
+        st.session_state.sandbars_decided = False
+    st.session_state.draw_map_v += 1
+    st.rerun()
+
+
+def reset_current_site(new_map_v: bool = True):
+    """Clears the in-progress site's drawn layers so a new (blank) site is
+    ready to draw - used both by the sidebar's explicit 'Start a new (blank)
+    site' button and automatically after 'Add to batch queue', since
+    queueing a site should immediately clear the way for the next one
+    rather than requiring a separate manual reset click."""
+    st.session_state.roi_gdf = None
+    st.session_state.lines_gdf = None
+    st.session_state.structures_gdf = None
+    st.session_state.sandbars_gdf = None
+    st.session_state.structures_decided = False
+    st.session_state.sandbars_decided = False
+    st.session_state.results_df = None
+    st.session_state.site_name = "new_site"
+    st.session_state.clear_sky_references = {}
+    st.session_state.preview_scene = None
+    if new_map_v:
+        st.session_state.draw_map_v += 1
+
+
+# --------------------------------------------------------------------------
+# Shared results rendering - used by both the single-site "Run & results"
+# tab and the "Analyse uploaded data" tab, so both present a results table
+# identically rather than maintaining two copies of the same metrics/plot
+# code that could quietly drift apart.
+# --------------------------------------------------------------------------
+
+def render_results_summary(combined: pd.DataFrame, key_prefix: str, download_filename: str):
+    """Renders the summary metrics, time-series plot, CSV download button,
+    and plot-click selection for an already-deduped results DataFrame (the
+    output of aggregate.prefer_sentinel_on_shared_dates, or an uploaded CSV
+    in that same shape - date/sensor/status/... columns). `key_prefix`
+    keeps this tab's Streamlit widget keys distinct from any other tab that
+    also calls this function in the same run.
+
+    If `combined` has a 'site' column with more than one distinct value
+    (e.g. a batch run's combined CSV, single or re-uploaded), a selectbox
+    lets the user narrow the view to one site or see every site combined -
+    single-site results (no 'site' column) skip that control entirely.
+
+    Returns (view, selected) - `view` is whatever subset of `combined` the
+    site filter narrowed to (== combined if there's no filter or "All
+    sites" is chosen), and `selected` is the pandas Series for the
+    plot-clicked point, or None if nothing's been clicked yet - callers
+    that can offer a scene preview (i.e. have an actual site geometry to
+    fetch imagery for) use `selected` to drive that; callers that can't
+    (e.g. arbitrary uploaded data with no corresponding site loaded) can
+    just ignore it.
+    """
+    view = combined
+    if "site" in combined.columns and combined["site"].nunique() > 1:
+        site_choice = st.selectbox(
+            "Site", ["All sites combined"] + sorted(combined["site"].dropna().unique().tolist()),
+            key=f"{key_prefix}_site_filter",
+        )
+        if site_choice != "All sites combined":
+            view = combined[combined["site"] == site_choice]
+
+    method_choice = st.radio(
+        "Classify using",
+        ["Combined (open if either method connects)", "NDWI only", "fmask only"],
+        horizontal=True,
+        key=f"{key_prefix}_method",
+        help=(
+            "Combined (the default) calls a scene open if either method finds a "
+            "connected path - this is what feeds the site-level statistics normally. "
+            "NDWI/fmask only shows just that one method's own result, ignoring "
+            "whether the other method agrees - useful for comparing the two or for "
+            "digging into a scene where they disagree."
+        ),
+    )
+    status_col = {
+        "Combined (open if either method connects)": "status",
+        "NDWI only": "status_ndwi",
+        "fmask only": "status_fmask",
+    }[method_choice]
+
+    counts = aggregate.summary_counts(view, status_col=status_col)
+    prop_closed = aggregate.mean_monthly_proportion_closed(view, status_col=status_col)
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Open scenes", counts["n_open"])
+    m2.metric("Closed scenes", counts["n_closed"])
+    m3.metric("Indeterminate", counts["n_indeterminate"])
+    m4.metric(
+        "Mean monthly % closed",
+        f"{prop_closed * 100:.1f}%" if prop_closed is not None else "n/a",
+    )
+
+    # Combined values are "open"/"closed"/"indeterminate"; the per-method columns
+    # use "TRUE"/"FALSE"/"indeterminate" - one map covers both vocabularies.
+    status_y = {"closed": 0, "FALSE": 0, "indeterminate": 0.5, "open": 1, "TRUE": 1}
+    fig = go.Figure()
+    for sensor, symbol, color in [("landsat", "circle-open", PASTEL["landsat"]), ("sentinel2", "circle", PASTEL["sentinel"])]:
+        sub = view[view["sensor"] == sensor]
+        if len(sub) == 0:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=sub["date"],
+                y=sub[status_col].map(status_y),
+                mode="markers",
+                name=sensor,
+                marker=dict(symbol=symbol, size=10, color=color),
+                customdata=np.stack([sub["date"].dt.strftime("%Y-%m-%d"), sub["sensor"]], axis=-1),
+                hovertemplate="%{x|%Y-%m-%d}<br>%{text}<extra></extra>",
+                text=sub[status_col],
+            )
+        )
+    fig.update_yaxes(tickvals=[0, 0.5, 1], ticktext=["closed", "indeterminate", "open"], range=[-0.2, 1.2])
+    fig.update_layout(height=420, margin=dict(t=20, b=20), clickmode="event+select")
+
+    dl_col, _ = st.columns([1, 3])
+    with dl_col:
+        st.download_button(
+            "Download results as CSV",
+            data=view.to_csv(index=False).encode("utf-8"),
+            file_name=download_filename,
+            mime="text/csv",
+            key=f"{key_prefix}_download",
+        )
+
+    event = st.plotly_chart(fig, key=f"{key_prefix}_ts_plot", on_select="rerun", use_container_width=True)
+
+    selected = None
+    if event and event.get("selection", {}).get("points"):
+        pt = event["selection"]["points"][0]
+        cd = pt.get("customdata")
+        if cd:
+            sel_date = pd.Timestamp(cd[0])
+            sel_sensor = cd[1]
+            match = view[(view["date"] == sel_date) & (view["sensor"] == sel_sensor)]
+            if len(match) > 0:
+                selected = match.iloc[0]
+
+    return view, selected
 
 
 # --------------------------------------------------------------------------
@@ -189,25 +479,40 @@ st.session_state.site_name = st.sidebar.text_input("Site name", value=st.session
 # filesystem). "Download" packages the current ROI/lines/structures into
 # one JSON file; "Upload" reads a previously-downloaded file back in.
 st.sidebar.markdown("**Save site layers**")
-can_save = st.session_state.roi_gdf is not None and st.session_state.lines_gdf is not None
+can_save = current_draw_step() == "ready"
 if can_save:
     _site_for_download = SiteLayers(
         name=st.session_state.site_name,
         roi=st.session_state.roi_gdf,
         lines=st.session_state.lines_gdf,
         structures=st.session_state.structures_gdf,
+        sandbars=st.session_state.sandbars_gdf,
     )
-    st.sidebar.download_button(
-        "Download site layers (.json)",
-        data=_site_for_download.to_json_bytes(),
-        file_name=f"{st.session_state.site_name}_site.json",
-        mime="application/json",
-        help="Saves the current ROI, inside/outside lines and structures to a single file "
-             "on your own computer - upload it below any time to restore this exact site "
-             "without redrawing.",
-    )
+    save_dl_col, save_queue_col = st.sidebar.columns(2)
+    with save_dl_col:
+        st.download_button(
+            "Download (.json)",
+            data=_site_for_download.to_json_bytes(),
+            file_name=f"{st.session_state.site_name}_site.json",
+            mime="application/json",
+            help="Saves the current ROI, inside/outside lines, structures and sandbars to a "
+                 "single file on your own computer - upload it below any time to restore this "
+                 "exact site without redrawing.",
+        )
+    with save_queue_col:
+        if st.button("Add to batch queue"):
+            st.session_state.site_queue = [s for s in st.session_state.site_queue if s.name != _site_for_download.name]
+            st.session_state.site_queue.append(_site_for_download)
+            n_queued = len(st.session_state.site_queue)
+            # Queueing immediately clears the way for the next site: this
+            # one stays visible (faded) on the draw tab's map via
+            # site_queue above, and the confirm buttons reset to red for a
+            # fresh blank site.
+            reset_current_site()
+            st.sidebar.success(f"Added - {n_queued} site(s) queued. Ready to draw the next site.")
+            st.rerun()
 else:
-    st.sidebar.caption("Draw a region (tab 1) and lines (tab 2) first to enable download.")
+    st.sidebar.caption("Complete all five steps in tab 1 (region, lines, structures, sandbars) first to enable saving.")
 
 st.sidebar.markdown("**Load site layers**")
 uploaded_site = st.sidebar.file_uploader(
@@ -219,31 +524,58 @@ if uploaded_site is not None and st.sidebar.button("Load uploaded site layers"):
         st.session_state.roi_gdf = loaded.roi
         st.session_state.lines_gdf = loaded.lines
         st.session_state.structures_gdf = loaded.structures
+        st.session_state.sandbars_gdf = loaded.sandbars
+        update_last_site_center(loaded.roi)
         st.session_state.structures_decided = True  # loading implies the decision was already made
+        st.session_state.sandbars_decided = True
         st.session_state.site_name = loaded.name
         st.session_state.results_df = None
         st.session_state.clear_sky_references = {}
         st.session_state.preview_scene = None
-        st.session_state.roi_map_v += 1
-        st.session_state.lines_map_v += 1
-        st.session_state.struct_map_v += 1
+        st.session_state.draw_map_v += 1
         st.sidebar.success(f"Loaded '{loaded.name}'.")
         st.rerun()
     except Exception as e:
         st.sidebar.error(str(e))
 
 if st.sidebar.button("Start a new (blank) site"):
-    st.session_state.roi_gdf = None
-    st.session_state.lines_gdf = None
-    st.session_state.structures_gdf = None
-    st.session_state.structures_decided = False
-    st.session_state.results_df = None
-    st.session_state.clear_sky_references = {}
-    st.session_state.preview_scene = None
-    st.session_state.roi_map_v += 1
-    st.session_state.lines_map_v += 1
-    st.session_state.struct_map_v += 1
+    reset_current_site()
     st.rerun()
+
+st.sidebar.markdown(f"**Sites queued for batch ({len(st.session_state.site_queue)})**")
+st.sidebar.caption(
+    "Draw a site in tab 1 and click 'Add to batch queue' above - it's added here and the map "
+    "clears (faded) for the next site automatically. Nothing here is saved to the server - it "
+    "only lives for this browser session, so download the batch's combined/per-site CSVs (tab 3) "
+    "before closing the tab."
+)
+if st.session_state.site_queue:
+    for i, qsite in enumerate(st.session_state.site_queue):
+        qcol1, qcol2 = st.sidebar.columns([4, 1])
+        qcol1.write(qsite.name)
+        if qcol2.button("✕", key=f"remove_queued_{i}"):
+            st.session_state.site_queue.pop(i)
+            st.rerun()
+
+with st.sidebar.expander("Bulk-add sites from JSON files", expanded=False):
+    bulk_uploads = st.file_uploader(
+        "Upload several previously-downloaded site-layers .json files at once",
+        type=["json"], accept_multiple_files=True, key="bulk_site_upload",
+    )
+    if bulk_uploads and st.button("Add all uploaded sites to the batch queue"):
+        added = []
+        existing_names = {s.name for s in st.session_state.site_queue}
+        for f in bulk_uploads:
+            try:
+                loaded_site = SiteLayers.from_json_bytes(f.getvalue())
+                if loaded_site.name not in existing_names:
+                    st.session_state.site_queue.append(loaded_site)
+                    existing_names.add(loaded_site.name)
+                    added.append(loaded_site.name)
+            except Exception as e:
+                st.warning(f"Could not load '{f.name}': {e}")
+        st.success(f"Added {len(added)} site(s) to the batch queue.")
+        st.rerun()
 
 with st.sidebar.expander("About the classification", expanded=False):
     st.markdown(
@@ -255,7 +587,11 @@ with st.sidebar.expander("About the classification", expanded=False):
         blocking the view. **Indeterminate** if cloud/no-data sits
         somewhere a path could plausibly have run through. Pixels under any
         drawn structure polygon (bridges, causeways) are always treated as
-        passable water.
+        passable water. Pixels under a drawn sandbar polygon are exempted
+        from the temporal-anomaly check only (if enabled) - a sandbar
+        appearing or disappearing between scenes isn't treated as
+        cloud/haze contamination, so its water/land call is never demoted
+        to indeterminate purely for looking different from its own history.
         """
     )
 
@@ -264,8 +600,11 @@ with st.sidebar.expander("About the classification", expanded=False):
 # Main layout: drawing workflow tabs + run/results tab
 # --------------------------------------------------------------------------
 
-tab_home, tab_roi, tab_lines, tab_struct, tab_run = st.tabs(
-    ["Home", "1. Region of interest", "2. Inside / outside lines", "3. Structures (optional)", "4. Run & results"]
+tab_home, tab_draw, tab_run, tab_batch, tab_upload = st.tabs(
+    [
+        "Home", "1. Draw & save site layers", "2. Run & results",
+        "3. Batch run (multiple sites)", "4. Analyse uploaded data",
+    ]
 )
 
 with tab_home:
@@ -301,175 +640,180 @@ with tab_home:
         """
         Work through the numbered tabs above in order, left to right:
 
-        1. **Region of interest** - draw a box or polygon around the estuary
-           mouth on the satellite map. This defines the area imagery is
-           fetched and clipped to, so keep it reasonably tight around the
-           mouth rather than the whole estuary.
-        2. **Inside / outside lines** - draw exactly two lines: one crossing
-           the water on the river ("inside") side of the mouth, one crossing
-           it on the ocean ("outside") side. On each satellite scene, the app
-           checks whether water connects these two lines - if it does, the
-           mouth is open on that date.
-        3. **Structures (optional)** - if a bridge or causeway crosses the
-           estuary near your lines, draw a polygon over it so it's always
-           treated as passable water, rather than wrongly breaking the
-           connection.
-        4. **Run & results** - pick a date range and maximum cloud cover,
+        1. **Draw & save site layers** - draw everything for one site on a
+           single map, confirming each layer in turn with the buttons beside
+           it (they turn from red to green as you go): region of interest,
+           inside line, outside line, structures, then sandbars.
+           Region/lines are required; structures and sandbars are optional -
+           just press their confirm button with nothing drawn if there
+           aren't any at this site. Once all five are green, click "Add to
+           batch queue" in the sidebar: this site's layers stay on the map
+           faded out, its name (auto-generated from the ROI's centroid, e.g.
+           `site_38.1234S_140.5678E`) is added to the batch queue, and the
+           buttons reset to red so you can draw the next site straight away.
+        2. **Run & results** - pick a date range and maximum cloud cover,
            then run the analysis. You'll get a time series plot of
            open/closed/indeterminate status, summary statistics (including
            the mean monthly proportion of time closed), and a scene preview
            where you can click any point on the plot to see exactly what the
            satellite image and classification looked like on that date.
+        3. **Batch run (multiple sites)** - draw and queue several sites in
+           tab 1 (see "Sites queued for batch" in the sidebar), then run the
+           same analysis across all of them in one go, downloading a
+           combined CSV and a per-site CSV zip at the end.
+        4. **Analyse uploaded data** - re-upload a results CSV this app
+           previously exported (from tab 2 or tab 3) to see the same
+           summary statistics and plot again without re-fetching anything
+           from DEA - handy for revisiting old results or combining CSVs
+           from separate sessions.
 
         A few other things worth knowing about, in the sidebar:
 
         - **Save / load site layers** lets you download your drawn ROI,
-          lines and structures as a single file, and re-upload it later to
-          pick up an existing site without redrawing.
+          lines, structures and sandbars as a single file, and re-upload it
+          later to pick up an existing site without redrawing. Auto-names
+          the site from its ROI's centroid (e.g. `site_38.1234S_140.5678E`)
+          when you confirm the region in tab 1.
+        - **Sites queued for batch** lists every site you've added this
+          session (one at a time via "Add to batch queue", or several at
+          once via "Bulk-add sites from JSON files"), ready for tab 3's
+          batch run - they also stay visible, faded, on tab 1's map as you
+          draw more sites. Nothing here is saved on the server - it only
+          lasts for this browser session.
         - **About the classification** (further down the sidebar) explains
           the open/closed/indeterminate logic in more detail.
-        - The "Advanced" sections in tab 4 (cloud-edge buffer, temporal
+        - The "Advanced" sections in tab 2 (cloud-edge buffer, temporal
           anomaly detection) are optional tuning for tricky sites where
           cloud or haze is causing false results - the defaults work well
           for most estuaries, so it's fine to leave them alone starting out.
         """
     )
 
-with tab_roi:
-    if st.session_state.roi_gdf is not None:
-        st.success("✓ ROI confirmed for this session.")
-        view_map = satellite_map(center=map_center_from_roi(), zoom=12)
-        add_context_layers(view_map, roi=st.session_state.roi_gdf)
-        st_folium(view_map, key=f"map_roi_view_{st.session_state.roi_map_v}", height=600, use_container_width=True)
-        if st.button("Redraw ROI"):
-            st.session_state.roi_gdf = None
-            st.session_state.roi_map_v += 1
-            st.rerun()
+with tab_draw:
+    step = current_draw_step()
+    confirmed = draw_step_confirmed()
+
+    if step == "ready":
+        st.success(
+            "✓ All layers confirmed for this site - click **Add to batch queue** in the sidebar "
+            "to queue it and start the next one."
+        )
     else:
         st.write(
-            "Use the polygon tool (top-left of the map) to draw a region around the estuary mouth. "
-            "This defines both the area rasters are fetched for and clipped to."
+            "Draw each layer on the map below, then press its confirm button on the right (it turns "
+            "green once confirmed). Work through them in order: region of interest, inside line, "
+            "outside line, structures, sandbars. Structures and sandbars are optional - press "
+            "their confirm button with nothing drawn if there aren't any at this site."
         )
-        m = satellite_map(center=map_center_from_roi(), zoom=5)
-        Draw(
-            export=False,
-            draw_options={"polygon": True, "polyline": False, "rectangle": True, "circle": False, "marker": False, "circlemarker": False},
-            edit_options={"edit": True, "remove": True},
-        ).add_to(m)
-        map_data = st_folium(m, key=f"map_roi_{st.session_state.roi_map_v}", height=750, use_container_width=True)
 
-        drawings = (map_data or {}).get("all_drawings") or []
-        polygons = [f for f in drawings if f["geometry"]["type"] in ("Polygon", "MultiPolygon")]
+    STEP_INSTRUCTIONS = {
+        "roi": "Use the polygon or rectangle tool to draw a region around the estuary mouth. This "
+               "defines both the area rasters are fetched for and clipped to.",
+        "inside": "Use the polyline tool to draw a line crossing the water on the river ('inside') "
+                  "side of the mouth.",
+        "outside": "Use the polyline tool to draw a line crossing the water on the ocean ('outside') "
+                   "side of the mouth.",
+        "structures": "Optional: draw polygons over any structures (bridges, causeways) that cross "
+                      "the estuary. Pixels under these are always treated as passable water.",
+        "sandbars": "Optional: draw polygons over any sandbar that can appear or disappear over "
+                    "time. Unlike structures, sandbar pixels are **not** forced to water - they "
+                    "keep whatever the ordinary NDWI/fmask classification finds. The only thing "
+                    "this changes is the temporal-anomaly check (tab 2's Advanced section, if "
+                    "enabled): pixels under a drawn sandbar are exempted from it entirely, rather "
+                    "than being wrongly flagged as indeterminate right where the mouth is most "
+                    "likely to open or close.",
+    }
+    if step in STEP_INSTRUCTIONS:
+        st.caption(STEP_INSTRUCTIONS[step])
 
-        if polygons:
-            st.info(f"{len(polygons)} polygon(s) drawn. Confirming will use the most recently drawn one.")
-            if st.button("Confirm ROI"):
-                gdf = geojson_features_to_gdf([polygons[-1]])
-                st.session_state.roi_gdf = gdf
-                st.rerun()
+    map_col, btn_col = st.columns([5, 1])
 
-with tab_lines:
-    if st.session_state.roi_gdf is None:
-        st.warning("Draw and confirm a region of interest in tab 1 first.")
-    elif st.session_state.lines_gdf is not None:
-        st.success("✓ Lines confirmed for this session (inside + outside).")
-        view_map = satellite_map(center=map_center_from_roi(), zoom=14)
-        add_context_layers(view_map, roi=st.session_state.roi_gdf, lines=st.session_state.lines_gdf)
-        st_folium(view_map, key=f"map_lines_view_{st.session_state.lines_map_v}", height=600, use_container_width=True)
-        if st.button("Redraw lines"):
-            st.session_state.lines_gdf = None
-            st.session_state.lines_map_v += 1
-            st.rerun()
-    else:
-        st.write(
-            "Use the polyline tool to draw exactly two lines: one crossing the river **inside** "
-            "the estuary, one crossing the ocean side **outside** the mouth."
-        )
-        m = satellite_map(center=map_center_from_roi(), zoom=14)
-        add_context_layers(m, roi=st.session_state.roi_gdf)
-        Draw(
-            export=False,
-            draw_options={"polygon": False, "polyline": True, "rectangle": False, "circle": False, "marker": False, "circlemarker": False},
-            edit_options={"edit": True, "remove": True},
-        ).add_to(m)
-        map_data = st_folium(m, key=f"map_lines_{st.session_state.lines_map_v}", height=750, use_container_width=True)
-
-        drawings = (map_data or {}).get("all_drawings") or []
-        line_feats = [f for f in drawings if f["geometry"]["type"] in ("LineString", "MultiLineString")]
-
-        if line_feats:
-            st.write(f"{len(line_feats)} line(s) drawn - assign each one:")
-            positions = []
-            cols = st.columns(len(line_feats))
-            for i, (col, feat) in enumerate(zip(cols, line_feats)):
-                with col:
-                    pos = st.selectbox(f"Line {i + 1}", ["inside", "outside", "(ignore)"], key=f"line_pos_{i}")
-                    positions.append(pos)
-            if st.button("Confirm lines"):
-                if positions.count("inside") != 1 or positions.count("outside") != 1:
-                    st.error("Assign exactly one line as 'inside' and exactly one as 'outside'.")
-                else:
-                    keep = [(f, p) for f, p in zip(line_feats, positions) if p != "(ignore)"]
-                    gdf = geojson_features_to_gdf([f for f, _ in keep])
-                    gdf["position"] = [p for _, p in keep]
-                    st.session_state.lines_gdf = gdf
-                    st.rerun()
-
-with tab_struct:
-    if st.session_state.roi_gdf is None:
-        st.warning("Draw and confirm a region of interest in tab 1 first.")
-    elif st.session_state.structures_decided:
-        has_structures = st.session_state.structures_gdf is not None and len(st.session_state.structures_gdf) > 0
-        if has_structures:
-            st.success(f"✓ {len(st.session_state.structures_gdf)} structure polygon(s) confirmed for this session.")
+    with map_col:
+        if st.session_state.roi_gdf is not None:
+            center, zoom = map_center_from_roi(), 14
+        elif st.session_state.last_site_center is not None:
+            # No in-progress ROI right now (e.g. just queued a site) - stay
+            # put on the last estuary that was defined rather than jumping
+            # back out to the whole-of-Australia view.
+            center, zoom = st.session_state.last_site_center, 14
         else:
-            st.success("✓ Confirmed: no structures at this site.")
-        view_map = satellite_map(center=map_center_from_roi(), zoom=14)
+            center, zoom = AUSTRALIA_CENTER, 5
+        m = satellite_map(center=center, zoom=zoom)
+
+        # Previously-queued sites this session, faded, so they stay visible
+        # as spatial context while drawing the next one on the same map.
+        for saved in st.session_state.site_queue:
+            add_context_layers(
+                m, roi=saved.roi, lines=saved.lines, structures=saved.structures,
+                sandbars=saved.sandbars, alpha=0.3,
+            )
+
+        # The current (in-progress) site's already-confirmed layers, full
+        # opacity, as non-editable context for whichever step is active now.
         add_context_layers(
-            view_map, roi=st.session_state.roi_gdf, lines=st.session_state.lines_gdf,
-            structures=st.session_state.structures_gdf,
+            m,
+            roi=st.session_state.roi_gdf if step != "roi" else None,
+            lines=st.session_state.lines_gdf,
+            structures=st.session_state.structures_gdf if step in ("sandbars", "ready") else None,
+            sandbars=st.session_state.sandbars_gdf if step == "ready" else None,
         )
-        st_folium(view_map, key=f"map_struct_view_{st.session_state.struct_map_v}", height=600, use_container_width=True)
-        if st.button("Redraw structures"):
-            st.session_state.structures_gdf = None
-            st.session_state.structures_decided = False
-            st.session_state.struct_map_v += 1
-            st.rerun()
-    else:
-        st.write(
-            "Optional: draw polygons over any structures (bridges, causeways) that cross the "
-            "estuary. Pixels under these are always treated as passable water, so a bridge deck "
-            "doesn't wrongly break the path between the two lines."
-        )
-        m = satellite_map(center=map_center_from_roi(), zoom=14)
-        add_context_layers(m, roi=st.session_state.roi_gdf, lines=st.session_state.lines_gdf)
-        Draw(
-            export=False,
-            draw_options={"polygon": True, "polyline": False, "rectangle": True, "circle": False, "marker": False, "circlemarker": False},
-            edit_options={"edit": True, "remove": True},
-        ).add_to(m)
-        map_data = st_folium(m, key=f"map_structures_{st.session_state.struct_map_v}", height=750, use_container_width=True)
+
+        draw_opts = {"polygon": False, "polyline": False, "rectangle": False, "circle": False, "marker": False, "circlemarker": False}
+        if step == "roi":
+            draw_opts["polygon"] = True
+            draw_opts["rectangle"] = True
+        elif step in ("inside", "outside"):
+            draw_opts["polyline"] = True
+        elif step in ("structures", "sandbars"):
+            draw_opts["polygon"] = True
+            draw_opts["rectangle"] = True
+
+        if step != "ready":
+            Draw(export=False, draw_options=draw_opts, edit_options={"edit": True, "remove": True}).add_to(m)
+
+        map_data = st_folium(m, key=f"draw_map_{st.session_state.draw_map_v}", height=700, use_container_width=True)
 
         drawings = (map_data or {}).get("all_drawings") or []
-        struct_polys = [f for f in drawings if f["geometry"]["type"] in ("Polygon", "MultiPolygon")]
+        if step == "roi" or step in ("structures", "sandbars"):
+            candidates = [f for f in drawings if f["geometry"]["type"] in ("Polygon", "MultiPolygon")]
+        elif step in ("inside", "outside"):
+            candidates = [f for f in drawings if f["geometry"]["type"] in ("LineString", "MultiLineString")]
+        else:
+            candidates = []
 
-        col1, col2 = st.columns(2)
-        with col1:
-            if struct_polys and st.button("Confirm structures"):
-                gdf = geojson_features_to_gdf(struct_polys)
-                st.session_state.structures_gdf = gdf
-                st.session_state.structures_decided = True
-                st.rerun()
-        with col2:
-            if st.button("No structures at this site"):
-                st.session_state.structures_gdf = None
-                st.session_state.structures_decided = True
-                st.rerun()
+    with btn_col:
+        st.caption("Confirm in order:")
+        for s in DRAW_STEPS:
+            is_confirmed = confirmed[s]
+            is_active = s == step
+            css_key = f"confirm_btn_{s}"
+            colour = "#8FCB9B" if is_confirmed else "#E8A0A0"
+            st.markdown(
+                f"""<style>
+                .st-key-{css_key} button {{
+                    background-color: {colour} !important;
+                    border-color: {colour} !important;
+                    color: #1a1a1a !important;
+                }}
+                </style>""",
+                unsafe_allow_html=True,
+            )
+            if is_confirmed:
+                label = f"✓ {DRAW_STEP_LABELS[s]}"
+            else:
+                label = DRAW_STEP_LABELS[s]
+            with st.container(key=css_key):
+                clicked = st.button(label, key=f"btn_{s}", use_container_width=True, disabled=not (is_active or is_confirmed))
+            if clicked:
+                if is_confirmed:
+                    redraw_draw_step(s)
+                elif is_active:
+                    confirm_draw_step(s, candidates)
 
 with tab_run:
     ready = st.session_state.roi_gdf is not None and st.session_state.lines_gdf is not None
     if not ready:
-        st.warning("Complete tabs 1 and 2 (region + lines) before running an analysis.")
+        st.warning("Complete tab 1 (region + lines) before running an analysis.")
     else:
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -491,16 +835,20 @@ with tab_run:
             )
             buf_c1, buf_c2 = st.columns(2)
             with buf_c1:
-                cloud_buffer_s2 = st.number_input(
+                st.session_state.cloud_buffer_s2 = st.number_input(
                     "Sentinel-2 buffer (pixels, 10m each)", min_value=0, max_value=100,
-                    value=connectivity.DEFAULT_CLOUD_BUFFER_PX["sentinel2"],
+                    value=int(st.session_state.cloud_buffer_s2),
                 )
             with buf_c2:
-                cloud_buffer_ls = st.number_input(
+                st.session_state.cloud_buffer_ls = st.number_input(
                     "Landsat buffer (pixels, 30m each)", min_value=0, max_value=20,
-                    value=connectivity.DEFAULT_CLOUD_BUFFER_PX["landsat"],
+                    value=int(st.session_state.cloud_buffer_ls),
                 )
-        cloud_buffer_px = {"sentinel2": cloud_buffer_s2, "landsat": cloud_buffer_ls}
+        # Kept in session_state (not just a local variable) so the batch-run
+        # tab can reuse the same tuned values without duplicating this UI -
+        # cloud-buffer/temporal-anomaly settings are analysis-wide tuning,
+        # not really specific to a single run.
+        cloud_buffer_px = {"sentinel2": st.session_state.cloud_buffer_s2, "landsat": st.session_state.cloud_buffer_ls}
 
         with st.expander("Advanced: temporal cloud/haze anomaly detection", expanded=False):
             st.caption(
@@ -567,6 +915,7 @@ with tab_run:
                 roi=st.session_state.roi_gdf,
                 lines=st.session_state.lines_gdf,
                 structures=st.session_state.structures_gdf,
+                sandbars=st.session_state.sandbars_gdf,
             )
             problems = site.validate()
             if problems:
@@ -607,85 +956,9 @@ with tab_run:
         df = st.session_state.results_df
         if df is not None and len(df) > 0:
             combined = aggregate.prefer_sentinel_on_shared_dates(df)
-
-            method_choice = st.radio(
-                "Classify using",
-                ["Combined (open if either method connects)", "NDWI only", "fmask only"],
-                horizontal=True,
-                help=(
-                    "Combined (the default) calls a scene open if either method finds a "
-                    "connected path - this is what feeds the site-level statistics normally. "
-                    "NDWI/fmask only shows just that one method's own result, ignoring "
-                    "whether the other method agrees - useful for comparing the two or for "
-                    "digging into a scene where they disagree (see the connectivity "
-                    "diagnostic below for that)."
-                ),
+            combined, selected = render_results_summary(
+                combined, key_prefix="run", download_filename=f"{st.session_state.site_name}_results.csv",
             )
-            status_col = {
-                "Combined (open if either method connects)": "status",
-                "NDWI only": "status_ndwi",
-                "fmask only": "status_fmask",
-            }[method_choice]
-
-            counts = aggregate.summary_counts(combined, status_col=status_col)
-            prop_closed = aggregate.mean_monthly_proportion_closed(combined, status_col=status_col)
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Open scenes", counts["n_open"])
-            m2.metric("Closed scenes", counts["n_closed"])
-            m3.metric("Indeterminate", counts["n_indeterminate"])
-            m4.metric(
-                "Mean monthly % closed",
-                f"{prop_closed * 100:.1f}%" if prop_closed is not None else "n/a",
-            )
-
-            # Combined values are "open"/"closed"/"indeterminate"; the per-method columns
-            # use "TRUE"/"FALSE"/"indeterminate" - one map covers both vocabularies.
-            status_y = {"closed": 0, "FALSE": 0, "indeterminate": 0.5, "open": 1, "TRUE": 1}
-            fig = go.Figure()
-            for sensor, symbol, color in [("landsat", "circle-open", PASTEL["landsat"]), ("sentinel2", "circle", PASTEL["sentinel"])]:
-                sub = combined[combined["sensor"] == sensor]
-                if len(sub) == 0:
-                    continue
-                fig.add_trace(
-                    go.Scatter(
-                        x=sub["date"],
-                        y=sub[status_col].map(status_y),
-                        mode="markers",
-                        name=sensor,
-                        marker=dict(symbol=symbol, size=10, color=color),
-                        # customdata carries (date, sensor) so a click can be matched back
-                        # to its row directly - safer than relying on curve/trace index,
-                        # since a sensor's whole trace is skipped when it has no scenes.
-                        customdata=np.stack([sub["date"].dt.strftime("%Y-%m-%d"), sub["sensor"]], axis=-1),
-                        hovertemplate="%{x|%Y-%m-%d}<br>%{text}<extra></extra>",
-                        text=sub[status_col],
-                    )
-                )
-            fig.update_yaxes(tickvals=[0, 0.5, 1], ticktext=["closed", "indeterminate", "open"], range=[-0.2, 1.2])
-            fig.update_layout(height=420, margin=dict(t=20, b=20), clickmode="event+select")
-
-            dl_col, _ = st.columns([1, 3])
-            with dl_col:
-                st.download_button(
-                    "Download results as CSV",
-                    data=combined.to_csv(index=False).encode("utf-8"),
-                    file_name=f"{st.session_state.site_name}_results.csv",
-                    mime="text/csv",
-                )
-
-            event = st.plotly_chart(fig, key="ts_plot", on_select="rerun", use_container_width=True)
-
-            selected = None
-            if event and event.get("selection", {}).get("points"):
-                pt = event["selection"]["points"][0]
-                cd = pt.get("customdata")
-                if cd:
-                    sel_date = pd.Timestamp(cd[0])
-                    sel_sensor = cd[1]
-                    match = combined[(combined["date"] == sel_date) & (combined["sensor"] == sel_sensor)]
-                    if len(match) > 0:
-                        selected = match.iloc[0]
 
             st.divider()
             st.subheader("Scene preview")
@@ -702,6 +975,7 @@ with tab_run:
                     roi=st.session_state.roi_gdf,
                     lines=st.session_state.lines_gdf,
                     structures=st.session_state.structures_gdf,
+                    sandbars=st.session_state.sandbars_gdf,
                 )
 
                 # Only the single most-recently-viewed scene is ever kept in
@@ -863,6 +1137,12 @@ with tab_run:
                         anomaly_mask_here = connectivity.build_temporal_anomaly_mask(
                             bands["nbart_blue"], clear_sky_reference, st.session_state.temporal_anomaly_threshold,
                         )
+                        sandbars_for_overlay = site_for_preview.sandbars_reprojected(scene_crs)
+                        sandbar_mask_here = connectivity.build_structure_mask(fmask.shape, transform, sandbars_for_overlay)
+                        if sandbar_mask_here is not None:
+                            # Mirror process_scene()'s sandbar exemption exactly, so this
+                            # diagnostic overlay shows the same thing the real analysis does.
+                            anomaly_mask_here = anomaly_mask_here & ~sandbar_mask_here
 
                     mask_codes = np.full(fmask.shape, np.nan)
                     mask_labels = np.full(fmask.shape, "", dtype=object)
@@ -982,8 +1262,10 @@ with tab_run:
                     inside_gdf = site_for_preview.inside_line(scene_crs)
                     outside_gdf = site_for_preview.outside_line(scene_crs)
                     structures_gdf = site_for_preview.structures_reprojected(scene_crs)
+                    sandbars_gdf_preview = site_for_preview.sandbars_reprojected(scene_crs)
                     scene_result = connectivity.process_scene(
-                        bands, transform, inside_gdf, outside_gdf, structures_gdf, cloud_buffer_px=cloud_buffer_px,
+                        bands, transform, inside_gdf, outside_gdf, structures_gdf, sandbars_gdf_preview,
+                        cloud_buffer_px=cloud_buffer_px,
                         clear_sky_reference=clear_sky_reference, temporal_anomaly_threshold=st.session_state.temporal_anomaly_threshold,
                     )
                     check = scene_result.ndwi_check if diag_variant == "NDWI" else scene_result.fmask_check
@@ -1069,3 +1351,170 @@ with tab_run:
 
             with st.expander("Full results table"):
                 st.dataframe(combined)
+
+
+with tab_batch:
+    st.subheader("Batch run across queued sites")
+    if not st.session_state.site_queue:
+        st.info(
+            "No sites queued yet. Draw a site in tab 1 (its confirm buttons all turn green), then "
+            "click 'Add to batch queue' in the sidebar to add it here, or use 'Bulk-add sites from "
+            "JSON files' in the sidebar to add several previously-downloaded sites at once."
+        )
+    else:
+        st.write(
+            f"**{len(st.session_state.site_queue)} site(s) queued:** "
+            + ", ".join(s.name for s in st.session_state.site_queue)
+        )
+
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            b_start = st.date_input(
+                "Start date", value=LANDSAT5_START, min_value=LANDSAT5_START, max_value=date.today(), key="batch_start",
+            )
+        with bc2:
+            b_end = st.date_input(
+                "End date", value=date.today(), min_value=LANDSAT5_START, max_value=date.today(), key="batch_end",
+            )
+        with bc3:
+            b_max_cloud = st.slider(
+                "Max cloud cover (%) per scene", min_value=0, max_value=100, value=20, key="batch_max_cloud",
+            )
+
+        b_require_full_coverage = st.checkbox(
+            "Only use scenes that fully cover each site's drawn region (recommended)",
+            value=True, key="batch_full_coverage",
+        )
+        st.caption(
+            f"Uses the cloud-edge buffer and temporal-anomaly settings from tab 2's Advanced "
+            f"sections for every site in this batch (currently: Sentinel-2 buffer "
+            f"{st.session_state.cloud_buffer_s2}px, Landsat buffer {st.session_state.cloud_buffer_ls}px, "
+            f"temporal anomaly {'enabled' if st.session_state.enable_temporal_anomaly else 'disabled'}) "
+            "- adjust those in tab 2 first if needed. Each site's own scenes are still fetched and "
+            "processed in memory-bounded batches (see tab 2's memory notes), one site at a time - "
+            "nothing from any site is ever written to the server's disk."
+        )
+
+        if st.button("Run batch analysis", type="primary"):
+            progress_bar = st.progress(0.0)
+            status_text = st.empty()
+
+            def batch_progress_cb(done, total, message):
+                status_text.write(message)
+                if total:
+                    progress_bar.progress(min(done / total, 1.0))
+
+            with st.spinner(f"Running {len(st.session_state.site_queue)} site(s)..."):
+                combined_df, per_site_dfs, per_site_errors = fetch.run_batch_analysis(
+                    sites=st.session_state.site_queue,
+                    start_date=b_start.isoformat(),
+                    end_date=b_end.isoformat(),
+                    max_cloud=b_max_cloud,
+                    products_json_path=PRODUCTS_JSON,
+                    min_roi_coverage=fetch.FULL_COVERAGE_THRESHOLD if b_require_full_coverage else 0,
+                    progress_cb=batch_progress_cb,
+                    cloud_buffer_px={
+                        "sentinel2": st.session_state.cloud_buffer_s2, "landsat": st.session_state.cloud_buffer_ls,
+                    },
+                    enable_temporal_anomaly=st.session_state.enable_temporal_anomaly,
+                    temporal_anomaly_threshold=st.session_state.temporal_anomaly_threshold,
+                    temporal_anomaly_percentile=st.session_state.temporal_anomaly_percentile,
+                    temporal_anomaly_min_obs=st.session_state.temporal_anomaly_min_obs,
+                )
+                st.session_state.batch_combined_df = combined_df
+                st.session_state.batch_per_site_dfs = per_site_dfs
+                st.session_state.batch_per_site_errors = per_site_errors
+                status_text.write(f"Done - {len(combined_df)} scenes across {len(per_site_dfs)} site(s).")
+
+        if st.session_state.batch_per_site_errors:
+            st.warning(
+                "Some sites failed and were skipped:\n\n"
+                + "\n".join(f"- **{name}**: {err}" for name, err in st.session_state.batch_per_site_errors.items())
+            )
+
+        batch_combined = st.session_state.batch_combined_df
+        if batch_combined is not None and len(batch_combined) > 0:
+            st.divider()
+            st.subheader("Per-site summary")
+            summary_rows = []
+            for name, site_df in (st.session_state.batch_per_site_dfs or {}).items():
+                if site_df is None or len(site_df) == 0:
+                    summary_rows.append(dict(
+                        site=name, n_scenes=0, n_open=0, n_closed=0, n_indeterminate=0, mean_monthly_pct_closed=None,
+                    ))
+                    continue
+                counts = aggregate.summary_counts(site_df)
+                prop = aggregate.mean_monthly_proportion_closed(site_df)
+                summary_rows.append(dict(
+                    site=name, n_scenes=counts["n_total"], n_open=counts["n_open"], n_closed=counts["n_closed"],
+                    n_indeterminate=counts["n_indeterminate"],
+                    mean_monthly_pct_closed=round(prop * 100, 1) if prop is not None else None,
+                ))
+            st.dataframe(pd.DataFrame(summary_rows), use_container_width=True)
+
+            dl1, dl2, _ = st.columns([1, 1, 2])
+            with dl1:
+                st.download_button(
+                    "Download combined CSV (all sites)",
+                    data=batch_combined.to_csv(index=False).encode("utf-8"),
+                    file_name="batch_results_combined.csv",
+                    mime="text/csv",
+                )
+            with dl2:
+                zip_buf = io.BytesIO()
+                with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for name, site_df in (st.session_state.batch_per_site_dfs or {}).items():
+                        if site_df is None or len(site_df) == 0:
+                            continue
+                        csv_bytes = site_df.to_csv(index=False).encode("utf-8")
+                        zf.writestr(f"{name}_results.csv", csv_bytes)
+                st.download_button(
+                    "Download per-site CSVs (zip)",
+                    data=zip_buf.getvalue(),
+                    file_name="batch_results_per_site.zip",
+                    mime="application/zip",
+                )
+
+
+with tab_upload:
+    st.subheader("Analyse previously exported results")
+    st.write(
+        "Upload a results CSV this app previously exported (tab 2's 'Download results as CSV', "
+        "tab 3's combined or per-site downloads, or an older session) to see the same summary "
+        "statistics and time-series plot again without re-fetching anything from DEA."
+    )
+    uploaded = st.file_uploader("Results CSV", type=["csv"], key="upload_csv")
+    if uploaded is not None:
+        try:
+            up_df = pd.read_csv(uploaded)
+            required_cols = {"date", "sensor", "status"}
+            missing = required_cols - set(up_df.columns)
+            if missing:
+                st.error(
+                    f"This CSV is missing required column(s): {', '.join(sorted(missing))}. "
+                    "Expected the same columns this app's own results CSV export has."
+                )
+            else:
+                up_df["date"] = pd.to_datetime(up_df["date"])
+                # Dedupe per site (not globally) if this is a multi-site combined
+                # CSV - a naive global dedupe-by-date would otherwise wrongly drop
+                # rows just because two different sites happened to share a date.
+                if "site" in up_df.columns and up_df["site"].nunique() > 1:
+                    up_df = up_df.groupby("site", group_keys=False).apply(aggregate.prefer_sentinel_on_shared_dates)
+                else:
+                    up_df = aggregate.prefer_sentinel_on_shared_dates(up_df)
+                st.session_state.uploaded_results_df = up_df
+        except Exception as e:
+            st.error(f"Could not read this CSV: {e}")
+
+    up_df = st.session_state.uploaded_results_df
+    if up_df is not None and len(up_df) > 0:
+        st.divider()
+        render_results_summary(up_df, key_prefix="upload", download_filename="uploaded_results_reexport.csv")
+        st.caption(
+            "Scene preview isn't available here since this data wasn't just fetched from DEA - "
+            "load the matching site in tab 1 and use tab 2's scene preview if you want to "
+            "inspect a specific date's imagery."
+        )
+        with st.expander("Full results table"):
+            st.dataframe(up_df)

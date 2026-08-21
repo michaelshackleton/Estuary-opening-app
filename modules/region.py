@@ -1,8 +1,8 @@
 """
-Manages the three user-drawn layers for a site (ROI polygon, inside/outside
-lines, optional structure polygons), including saving/loading them as a
-single GeoJSON-based bundle - so an analysis can be reproduced later
-without redrawing.
+Manages the user-drawn layers for a site (ROI polygon, inside/outside
+lines, optional structure polygons, optional sandbar polygons), including
+saving/loading them as a single GeoJSON-based bundle - so an analysis can
+be reproduced later without redrawing.
 
 CLOUD-HOSTING NOTE: this module is a fork of Claude_script/modules/region.py
 (the original desktop app's version), adapted for Streamlit Community Cloud
@@ -42,12 +42,40 @@ def auto_utm_epsg(lon: float, lat: float) -> int:
     return (32700 if lat < 0 else 32600) + zone
 
 
+def name_from_centroid(roi_gdf: gpd.GeoDataFrame, prefix: str = "site", decimals: int = 4) -> str:
+    """Builds a site name like 'site_38.1234S_140.5678E' from the ROI
+    polygon's centroid (computed in WGS84 regardless of the GeoDataFrame's
+    current CRS) - lets sites be named automatically and consistently
+    rather than requiring the user to type a unique name for every site,
+    which matters once you're drawing many sites in one session for a
+    batch run. N/S and E/W suffixes are used instead of a signed number so
+    the name reads naturally as a coordinate and stays safe as a filename
+    if downloaded. Two sites would only collide if their ROI centroids
+    matched to `decimals` places (4 decimals is ~11m at the equator) -
+    vanishingly unlikely for genuinely different estuaries."""
+    centroid = roi_gdf.to_crs(WGS84).geometry.iloc[0].centroid
+    lat, lon = centroid.y, centroid.x
+    ns = "S" if lat < 0 else "N"
+    ew = "W" if lon < 0 else "E"
+    return f"{prefix}_{abs(lat):.{decimals}f}{ns}_{abs(lon):.{decimals}f}{ew}"
+
+
 @dataclass
 class SiteLayers:
     name: str
     roi: gpd.GeoDataFrame  # single polygon, EPSG:4326
     lines: gpd.GeoDataFrame  # two lines with a 'position' column: inside/outside, EPSG:4326
     structures: Optional[gpd.GeoDataFrame] = None  # optional polygons, EPSG:4326
+    # Optional polygons marking sandbars - areas that can genuinely
+    # alternate between exposed sand and open water. Unlike `structures`
+    # (always forced to water), a sandbar is NOT forced either way - it's
+    # exempted only from the temporal-anomaly check (see
+    # connectivity.process_scene's `sandbars_gdf` param), so its pixels
+    # keep whatever the ordinary NDWI/fmask classification found, rather
+    # than being flagged as no-data/uncertain just because a sandbar
+    # popping up (or a wet one going under) makes the pixel read
+    # differently from its own clear-sky history.
+    sandbars: Optional[gpd.GeoDataFrame] = None  # optional polygons, EPSG:4326
 
     # -- validation ---------------------------------------------------
     def validate(self) -> list[str]:
@@ -96,12 +124,18 @@ class SiteLayers:
             return None
         return self.structures.to_crs(target_crs)
 
+    def sandbars_reprojected(self, target_crs) -> Optional[gpd.GeoDataFrame]:
+        if self.sandbars is None or len(self.sandbars) == 0:
+            return None
+        return self.sandbars.to_crs(target_crs)
+
     # -- save / load (GeoJSON bundle, for browser upload/download) --------
-    # A single JSON file with three embedded GeoJSON FeatureCollections
-    # (roi/lines/structures) plus the site name - simpler and more portable
-    # for a cloud app than a multi-file shapefile bundle, and needs no
-    # filesystem access at all (see module docstring). The app's sidebar
-    # wires these into st.download_button (save) / st.file_uploader (load).
+    # A single JSON file with embedded GeoJSON FeatureCollections
+    # (roi/lines/structures/sandbars) plus the site name - simpler and more
+    # portable for a cloud app than a multi-file shapefile bundle, and
+    # needs no filesystem access at all (see module docstring). The app's
+    # sidebar wires these into st.download_button (save) / st.file_uploader
+    # (load).
 
     def to_geojson_dict(self) -> dict:
         return {
@@ -111,6 +145,11 @@ class SiteLayers:
             "structures": (
                 json.loads(self.structures.to_crs(WGS84).to_json())
                 if self.structures is not None and len(self.structures) > 0
+                else None
+            ),
+            "sandbars": (
+                json.loads(self.sandbars.to_crs(WGS84).to_json())
+                if self.sandbars is not None and len(self.sandbars) > 0
                 else None
             ),
         }
@@ -127,7 +166,10 @@ class SiteLayers:
         structures = None
         if d.get("structures"):
             structures = gpd.GeoDataFrame.from_features(d["structures"]["features"], crs=WGS84)
-        return cls(name=d.get("name") or "site", roi=roi, lines=lines, structures=structures)
+        sandbars = None
+        if d.get("sandbars"):
+            sandbars = gpd.GeoDataFrame.from_features(d["sandbars"]["features"], crs=WGS84)
+        return cls(name=d.get("name") or "site", roi=roi, lines=lines, structures=structures, sandbars=sandbars)
 
     @classmethod
     def from_json_bytes(cls, data: bytes) -> "SiteLayers":
